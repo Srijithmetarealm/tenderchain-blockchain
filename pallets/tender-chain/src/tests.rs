@@ -825,7 +825,7 @@ fn voided_bid_cannot_be_scored_or_awarded() {
 				],
 				[4u8; 32]
 			),
-			Error::<Test>::InvalidAwardee
+			Error::<Test>::BidNotScoreable
 		);
 		appoint_and_activate(id, EVAL_2);
 		assert_noop!(
@@ -1463,6 +1463,32 @@ fn dismissing_a_second_challenge_does_not_undo_an_upheld_one() {
 		// Second dismissed -> must stay remitted, not snap back to Awarded.
 		assert_ok!(TenderChain::resolve_challenge(RuntimeOrigin::root(), id, challenge_ids(id)[1], false, resolution()));
 		assert!(matches!(TenderChain::tenders(id).unwrap().state, TenderState::Evaluation));
+	});
+}
+
+/// A re-award while a challenge against the overturned award is still open
+/// would let that stale challenge, once upheld, remit the *new* award.
+#[test]
+fn re_award_waits_for_every_open_challenge() {
+	new_test_ext().execute_with(|| {
+		let id = to_evaluation_with_three_bids(0);
+		appoint_and_activate(id, EVAL_1);
+		appoint_and_activate(id, EVAL_2);
+		score(id, EVAL_1, BIDDER_A, 80, 70);
+		score(id, EVAL_2, BIDDER_A, 80, 70);
+		assert_ok!(TenderChain::award(RuntimeOrigin::root(), id, vec![BIDDER_A], RATIONALE));
+		assert_ok!(TenderChain::lodge_challenge(RuntimeOrigin::signed(BIDDER_B), id, grounds(), None));
+		assert_ok!(TenderChain::lodge_challenge(RuntimeOrigin::signed(BIDDER_C), id, grounds(), None));
+		assert_ok!(TenderChain::resolve_challenge(RuntimeOrigin::root(), id, challenge_ids(id)[0], true, resolution()));
+
+		assert_noop!(
+			TenderChain::award(RuntimeOrigin::root(), id, vec![BIDDER_A], RATIONALE),
+			Error::<Test>::ChallengeOpen
+		);
+
+		assert_ok!(TenderChain::resolve_challenge(RuntimeOrigin::root(), id, challenge_ids(id)[1], false, resolution()));
+		assert_ok!(TenderChain::award(RuntimeOrigin::root(), id, vec![BIDDER_A], RATIONALE));
+		assert!(matches!(TenderChain::tenders(id).unwrap().state, TenderState::Awarded));
 	});
 }
 
@@ -3049,5 +3075,153 @@ fn an_extension_preserves_the_gap_before_opening() {
 		assert_ok!(TenderChain::publish_addendum(RuntimeOrigin::signed(OFFICER), id, [0x44u8; 32], Some(20)));
 		let g = TenderChain::tenders(id).unwrap().gates;
 		assert_eq!((g.submission_close_at, g.opening_at, g.opening_end_at), (20, 22, 27));
+	});
+}
+
+// ---------------------------------------------------------------
+// Deleting tenders that never reached the public record
+// ---------------------------------------------------------------
+
+#[test]
+fn a_draft_can_be_deleted_by_its_officer() {
+	new_test_ext().execute_with(|| {
+		let id = create(0);
+		appoint_and_activate(id, EVAL_1);
+		assert_ok!(TenderChain::delete_tender(RuntimeOrigin::signed(OFFICER), id));
+
+		assert!(TenderChain::tenders(id).is_none());
+		assert!(TenderChain::evaluator_set(id, EVAL_1).is_none());
+		assert_eq!(crate::AppointedEvaluatorCount::<Test>::get(id), 0);
+		assert_eq!(crate::ActiveEvaluatorCount::<Test>::get(id), 0);
+		System::assert_last_event(Event::TenderDeleted { tender_id: id, by: OFFICER }.into());
+	});
+}
+
+#[test]
+fn a_draft_can_be_deleted_by_its_entity() {
+	new_test_ext().execute_with(|| {
+		let id = create(0);
+		assert_ok!(TenderChain::delete_tender(RuntimeOrigin::signed(ENTITY), id));
+		assert!(TenderChain::tenders(id).is_none());
+	});
+}
+
+#[test]
+fn a_draft_cancelled_before_publication_can_be_deleted() {
+	new_test_ext().execute_with(|| {
+		let id = create(0);
+		assert_ok!(TenderChain::cancel_tender(RuntimeOrigin::signed(ENTITY), id, [7u8; 32]));
+		assert_ok!(TenderChain::delete_tender(RuntimeOrigin::signed(OFFICER), id));
+		assert!(TenderChain::tenders(id).is_none());
+	});
+}
+
+#[test]
+fn a_published_tender_cannot_be_deleted() {
+	new_test_ext().execute_with(|| {
+		let id = create_and_publish(0);
+		assert_noop!(
+			TenderChain::delete_tender(RuntimeOrigin::signed(OFFICER), id),
+			Error::<Test>::TenderNotDeletable
+		);
+		// Cancelling it does not make it deletable: the cancellation and its
+		// reason are themselves part of the public record.
+		assert_ok!(TenderChain::cancel_tender(RuntimeOrigin::signed(ENTITY), id, [7u8; 32]));
+		assert_noop!(
+			TenderChain::delete_tender(RuntimeOrigin::signed(OFFICER), id),
+			Error::<Test>::TenderNotDeletable
+		);
+	});
+}
+
+#[test]
+fn only_the_officer_or_entity_may_delete() {
+	new_test_ext().execute_with(|| {
+		let id = create(0);
+		assert_noop!(
+			TenderChain::delete_tender(RuntimeOrigin::signed(BIDDER_A), id),
+			Error::<Test>::NotOfficer
+		);
+		assert_noop!(
+			TenderChain::delete_tender(RuntimeOrigin::signed(OFFICER), [0x55u8; 32]),
+			Error::<Test>::TenderNotFound
+		);
+	});
+}
+
+#[test]
+fn a_shortlist_cannot_name_the_same_supplier_twice() {
+	new_test_ext().execute_with(|| {
+		let eoi = eoi_to_shortlist();
+		assert_noop!(
+			TenderChain::publish_shortlist(RuntimeOrigin::signed(OFFICER), eoi, vec![BIDDER_A, BIDDER_A]),
+			Error::<Test>::DuplicateShortlistEntry
+		);
+	});
+}
+
+// ---------------------------------------------------------------
+// Refusals name the actual reason
+// ---------------------------------------------------------------
+
+#[test]
+fn questions_after_the_qa_window_report_questions_closed() {
+	new_test_ext().execute_with(|| {
+		let draft = create(0);
+		assert_noop!(
+			TenderChain::ask_question(RuntimeOrigin::signed(BIDDER_A), draft, [0x11u8; 32], SALT_A),
+			Error::<Test>::TenderNotPublished
+		);
+		assert_ok!(TenderChain::publish_tender(RuntimeOrigin::signed(OFFICER), draft));
+		run_to_block(6); // past questions_close_at = 5
+		assert_noop!(
+			TenderChain::ask_question(RuntimeOrigin::signed(BIDDER_A), draft, [0x11u8; 32], SALT_A),
+			Error::<Test>::QuestionsClosed
+		);
+	});
+}
+
+#[test]
+fn bids_after_close_report_submission_closed_not_unpublished() {
+	new_test_ext().execute_with(|| {
+		let id = create_and_publish(0);
+		run_to_block(11); // wheel has moved the tender to Closed
+		assert_noop!(
+			TenderChain::commit_bid(RuntimeOrigin::signed(BIDDER_A), id, [0x42u8; 32]),
+			Error::<Test>::SubmissionClosed
+		);
+	});
+}
+
+#[test]
+fn opening_before_the_opening_block_reports_opening_not_reached() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(TenderChain::create_tender(
+			RuntimeOrigin::signed(OFFICER),
+			ENTITY,
+			TenderKind::Rft,
+			BidMode::Sealed,
+			TITLE.to_vec(),
+			SUMMARY.to_vec(),
+			NOTICE,
+			CRITERIA,
+			weights(),
+			TenderGates { publish_at: 1, questions_close_at: 5, submission_close_at: 10, opening_at: 14, opening_end_at: 30 },
+			20,
+			vec![],
+			0,
+			bond(0),
+			false,
+			None,
+		));
+		let id = last_tender_id();
+		assert_ok!(TenderChain::publish_tender(RuntimeOrigin::signed(OFFICER), id));
+		run_to_block(11);
+		assert_noop!(
+			TenderChain::open_tender(RuntimeOrigin::signed(OFFICER), id),
+			Error::<Test>::OpeningNotReached
+		);
+		run_to_block(14);
+		assert_ok!(TenderChain::open_tender(RuntimeOrigin::signed(OFFICER), id));
 	});
 }

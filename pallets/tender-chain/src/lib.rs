@@ -513,6 +513,9 @@ pub mod pallet {
 		BondReturned { tender_id: TenderId, bidder: T::AccountId, amount: BalanceOf<T> },
 		BondForfeited { tender_id: TenderId, bidder: T::AccountId, amount: BalanceOf<T> },
 		TenderCancelled { tender_id: TenderId, reason_hash: Hash256 },
+		/// A tender that never reached the public record was deleted outright,
+		/// along with any evaluator appointments made while it was a draft.
+		TenderDeleted { tender_id: TenderId, by: T::AccountId },
 		/// A deadline could not be re-queued because every block in the
 		/// look-ahead window was full. Recorded so the stall is visible to
 		/// probity observers rather than silent.
@@ -678,6 +681,20 @@ pub mod pallet {
 		AddendumNeedsExtension,
 		/// This panel already holds `MaxCallOffs` call-off orders.
 		TooManyCallOffs,
+		/// Only a tender that was never published (a draft, or a draft cancelled
+		/// before publication) can be deleted. A published tender is part of the
+		/// public record: it can be cancelled, with a reason, but never erased.
+		TenderNotDeletable,
+		/// This bidder has no valid revealed bid on this tender — it never
+		/// revealed, withdrew, or its reveal did not match its commitment — so
+		/// there is nothing to score.
+		BidNotScoreable,
+		/// The same supplier was listed twice in one shortlist.
+		DuplicateShortlistEntry,
+		/// The Q&A window has closed; no more questions can be asked.
+		QuestionsClosed,
+		/// The tender's opening block has not been reached yet.
+		OpeningNotReached,
 	}
 
 	// -------------------------------------------------------------
@@ -908,10 +925,13 @@ pub mod pallet {
 			let asker = ensure_signed(origin)?;
 			let now = frame_system::Pallet::<T>::block_number();
 			let tender = Tenders::<T>::get(tender_id).ok_or(Error::<T>::TenderNotFound)?;
-			ensure!(matches!(tender.state, TenderState::QaWindow), Error::<T>::BadState);
+			// A tender past its Q&A window says so, rather than a generic
+			// `BadState`; a draft has simply not been published.
+			ensure!(!matches!(tender.state, TenderState::Draft), Error::<T>::TenderNotPublished);
+			ensure!(matches!(tender.state, TenderState::QaWindow), Error::<T>::QuestionsClosed);
 			// The block number closes questions even if the wheel has not yet
 			// processed the gate (e.g. it was deferred by a busy block).
-			ensure!(now < tender.gates.questions_close_at, Error::<T>::BadState);
+			ensure!(now < tender.gates.questions_close_at, Error::<T>::QuestionsClosed);
 
 			// Questions are never removed, so the count bounds state growth. The
 			// Q&A window is open to any account, so without this an attacker
@@ -1190,7 +1210,7 @@ pub mod pallet {
 				let tender = maybe.as_mut().ok_or(Error::<T>::TenderNotFound)?;
 				Self::ensure_officer(tender, &who)?;
 				ensure!(matches!(tender.state, TenderState::Closed), Error::<T>::BadState);
-				ensure!(now >= tender.gates.opening_at, Error::<T>::BadState);
+				ensure!(now >= tender.gates.opening_at, Error::<T>::OpeningNotReached);
 				// Opening at the last moment would shrink the reveal window to
 				// nothing, which is the same lever as never opening at all.
 				ensure!(
@@ -1401,8 +1421,8 @@ pub mod pallet {
 			ensure!(rec.active, Error::<T>::ConflictNotDeclared);
 
 			// A voided or absent bid cannot be scored.
-			let reveal = Reveals::<T>::get(tender_id, &bidder).ok_or(Error::<T>::InvalidAwardee)?;
-			ensure!(reveal.valid, Error::<T>::InvalidAwardee);
+			let reveal = Reveals::<T>::get(tender_id, &bidder).ok_or(Error::<T>::BidNotScoreable)?;
+			ensure!(reveal.valid, Error::<T>::BidNotScoreable);
 
 			// Scores must cover exactly the locked criteria — no adding a criterion
 			// at scoring time, no quietly dropping one.
@@ -1481,6 +1501,11 @@ pub mod pallet {
 			let tender = Tenders::<T>::get(tender_id).ok_or(Error::<T>::TenderNotFound)?;
 			ensure!(matches!(tender.state, TenderState::Evaluation), Error::<T>::BadState);
 			ensure!(!matches!(tender.kind, TenderKind::Eoi), Error::<T>::EoiUsesShortlist);
+			// After an upheld challenge remits the tender, any other challenge
+			// against the overturned award may still be open. Re-awarding over it
+			// would let that stale challenge, once upheld, knock the *new* award
+			// back to evaluation — so every challenge must be ruled on first.
+			ensure!(OpenChallengeCount::<T>::get(tender_id) == 0, Error::<T>::ChallengeOpen);
 			ensure!(
 				ActiveEvaluatorCount::<T>::get(tender_id) >= T::MinEvaluators::get(),
 				Error::<T>::TooFewEvaluators
@@ -1819,8 +1844,10 @@ pub mod pallet {
 			);
 
 			// Only a supplier who actually responded, with a bid that survived
-			// reveal validation, may be shortlisted.
-            for s in suppliers.iter() {
+			// reveal validation, may be shortlisted — and only once, or
+			// `ShortlistCount` would overstate the shortlist.
+			for (i, s) in suppliers.iter().enumerate() {
+				ensure!(!suppliers[..i].contains(s), Error::<T>::DuplicateShortlistEntry);
 				let reveal = Reveals::<T>::get(tender_id, s)
 					.ok_or(Error::<T>::InvalidShortlistEntry)?;
 				ensure!(reveal.valid, Error::<T>::InvalidShortlistEntry);
@@ -1932,6 +1959,39 @@ pub mod pallet {
 			Self::deposit_event(Event::PolicyUpdated { policy });
 			Ok(())
 		}
+
+		/// Delete a tender that never reached the public record.
+		///
+		/// Allowed for the officer or the entity, and only while the tender has
+		/// never been published: a `Draft`, or a draft that was cancelled before
+		/// publication. Nothing public exists for such a tender yet — no notice
+		/// went out, nobody bid, no bond is held — so erasing it hides nothing.
+		/// Once a tender is published it is part of the procurement record
+		/// (spec §5.1) and `cancel_tender` is the only way to end it early.
+		///
+		/// Evaluator appointments made during drafting are removed with it.
+		#[pallet::call_index(23)]
+		#[pallet::weight(T::WeightInfo::delete_tender(T::MaxEvaluators::get()))]
+		pub fn delete_tender(origin: OriginFor<T>, tender_id: TenderId) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			let tender = Tenders::<T>::get(tender_id).ok_or(Error::<T>::TenderNotFound)?;
+			Self::ensure_officer(&tender, &who)?;
+			ensure!(
+				tender.published_at.is_none() &&
+					matches!(tender.state, TenderState::Draft | TenderState::Cancelled),
+				Error::<T>::TenderNotDeletable
+			);
+
+			// Bounded by `MaxEvaluators`: `appoint_evaluator` refuses beyond it.
+			let _ = EvaluatorSet::<T>::clear_prefix(tender_id, T::MaxEvaluators::get(), None);
+			AppointedEvaluatorCount::<T>::remove(tender_id);
+			ActiveEvaluatorCount::<T>::remove(tender_id);
+			ShortlistSource::<T>::remove(tender_id);
+			Tenders::<T>::remove(tender_id);
+
+			Self::deposit_event(Event::TenderDeleted { tender_id, by: who });
+			Ok(())
+		}
 	}
 
 	// -------------------------------------------------------------
@@ -1966,9 +2026,12 @@ pub mod pallet {
 			bidder: &T::AccountId,
 		) -> DispatchResult {
 			let now = frame_system::Pallet::<T>::block_number();
+			// "Not published yet" and "already closed" are different situations
+			// for a bidder, so they are different errors.
+			ensure!(!matches!(tender.state, TenderState::Draft), Error::<T>::TenderNotPublished);
 			ensure!(
 				matches!(tender.state, TenderState::QaWindow | TenderState::Submission),
-				Error::<T>::TenderNotPublished
+				Error::<T>::SubmissionClosed
 			);
 			// Belt and braces alongside the wheel: even if a gate has not yet been
 			// processed, the block number itself closes submissions.

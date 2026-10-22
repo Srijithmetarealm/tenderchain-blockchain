@@ -470,4 +470,15 @@ impl<T: frame_system::Config> pallet_tender_chain::WeightInfo for WeightInfo<T> 
 		Weight::from_parts(15_000_000, 0)
 			.saturating_add(T::DbWeight::get().writes(1))
 	}
+	/// PROVISIONAL, hand-added — not measured. One `Tenders` read, removal of
+	/// the tender and its counters, and one `EvaluatorSet` removal per
+	/// appointment. Overwritten by the next benchmark run.
+	fn delete_tender(e: u32, ) -> Weight {
+		Weight::from_parts(40_000_000, 0)
+			.saturating_add(Weight::from_parts(0, 4282))
+			.saturating_add(Weight::from_parts(5_000_000, 0).saturating_mul(e.into()))
+			.saturating_add(T::DbWeight::get().reads(1))
+			.saturating_add(T::DbWeight::get().writes(4))
+			.saturating_add(T::DbWeight::get().writes((1_u64).saturating_mul(e.into())))
+	}
 }

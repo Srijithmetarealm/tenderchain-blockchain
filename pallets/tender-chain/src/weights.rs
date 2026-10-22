@@ -65,6 +65,8 @@ pub trait WeightInfo {
 	/// `w`: number of weighted criteria.
 	fn amend_criteria(w: u32) -> Weight;
 	fn set_policy() -> Weight;
+	/// `e`: number of evaluator appointments removed.
+	fn delete_tender(e: u32) -> Weight;
 }
 
 /// Test/mock implementation. Not metered — never use in production.
@@ -193,6 +195,13 @@ impl WeightInfo for () {
 	fn set_policy() -> Weight {
 		Weight::from_parts(8_000_000, 0)
 			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	fn delete_tender(e: u32) -> Weight {
+		Weight::from_parts(20_000_000, 4_000)
+			.saturating_add(Weight::from_parts(2_000_000, 0).saturating_mul(e as u64))
+			.saturating_add(RocksDbWeight::get().reads(1_u64))
+			.saturating_add(RocksDbWeight::get().writes(4_u64))
+			.saturating_add(RocksDbWeight::get().writes((1_u64).saturating_mul(e as u64)))
 	}
 	fn on_initialize(n: u32) -> Weight {
 		Weight::from_parts(10_000_000, 3_000)

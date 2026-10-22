@@ -841,5 +841,29 @@ mod benchmarks {
 		Ok(())
 	}
 
+	#[benchmark]
+	fn delete_tender(e: Linear<0, { T::MaxEvaluators::get() }>) -> Result<(), BenchmarkError> {
+		start::<T>();
+		let officer: T::AccountId = whitelisted_caller();
+		fund::<T>(&officer);
+		let id = create::<T>(&officer, TenderKind::Rft, T::MaxWeights::get())?;
+		for i in 0..e {
+			let evaluator = funded_account::<T>("evaluator", i);
+			TenderChain::<T>::appoint_evaluator(
+				RawOrigin::Signed(officer.clone()).into(),
+				id,
+				evaluator,
+				[9u8; 32],
+			)?;
+		}
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(officer), id);
+
+		assert!(Tenders::<T>::get(id).is_none());
+		assert_eq!(AppointedEvaluatorCount::<T>::get(id), 0);
+		Ok(())
+	}
+
 	impl_benchmark_test_suite!(TenderChain, crate::mock::new_test_ext(), crate::mock::Test);
 }
