@@ -1,1 +1,4 @@
 target/
+
+# Project docs are kept locally, not in the repo
+docs/
